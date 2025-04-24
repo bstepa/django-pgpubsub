@@ -2,26 +2,33 @@ import logging
 from typing import Type, Union
 
 from django.db import connection
+
+from django.utils.connection import ConnectionProxy
+from django.db import connections, DEFAULT_DB_ALIAS
 from django.db.transaction import atomic
+from django.conf import settings
 
 from pgpubsub.channel import locate_channel, Channel, registry
-
 
 logger = logging.getLogger(__name__)
 
 
+DEFAULT_DB_ALIAS = getattr(settings, "PGPUBSUB_DEFAULT_DATABASE", DEFAULT_DB_ALIAS)
+
+# Taken from pgpubsub's notify but adde the option to specify the db connection
 @atomic
-def notify(channel: Union[Type[Channel], str], **kwargs):
+def notify(channel: Union[Type[Channel], str], database_alias: str = DEFAULT_DB_ALIAS, **kwargs):
     channel_cls = locate_channel(channel)
     channel = channel_cls(**kwargs)
     serialized = channel.serialize()
+    connection = ConnectionProxy(connections, database_alias)
     with connection.cursor() as cursor:
         name = channel_cls.name()
-        logger.info(f'Notifying channel {name} with payload {serialized}')
-        cursor.execute(
-            f"select pg_notify('{channel_cls.listen_safe_name()}', '{serialized}');")
+        logger.info(f"Notifying channel {name} with payload {serialized}")
+        cursor.execute(f"select pg_notify('{channel_cls.listen_safe_name()}', '{serialized}');")
         if channel_cls.lock_notifications:
             from pgpubsub.models import Notification
+
             Notification.objects.create(
                 channel=name,
                 payload=serialized,
@@ -54,8 +61,6 @@ def process_stored_notifications(channels=None):
             payload = ''
             logger.info(
                 f'Notifying channel {channel_cls.name()} to recover '
-                f'previously stored notifications.\n')
-            cursor.execute(
-                f"select pg_notify('{channel_cls.listen_safe_name()}', '{payload}');")
-
-
+                f'previously stored notifications.\n'
+            )
+            cursor.execute(f"select pg_notify('{channel_cls.listen_safe_name()}', '{payload}');")

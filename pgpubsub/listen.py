@@ -5,22 +5,32 @@ import select
 import sys
 from typing import List, Optional, Union
 
-from django.conf import settings
 from django.core.management import execute_from_command_line
 from django.db import connection, transaction
 from django.db.models import Func, Value, Q
 
 from pgpubsub import process_stored_notifications
 from pgpubsub.channel import (
-    BaseChannel,
     Channel,
+)
+from pgpubsub.compatibility import Notify, ConnectionWrapper
+from pgpubsub.listeners import ListenerFilterProvider
+from pgpubsub.models import Notification
+
+from django.utils.connection import ConnectionProxy
+from django.db import connections, DEFAULT_DB_ALIAS
+
+from django.conf import settings
+
+from pgpubsub.channel import (
+    BaseChannel,
     ChannelNotFound,
     locate_channel,
     registry,
 )
-from pgpubsub.compatibility import ConnectionWrapper, Notify
-from pgpubsub.listeners import ListenerFilterProvider
-from pgpubsub.models import Notification
+
+
+DEFAULT_DB_ALIAS = getattr(settings, "PGPUBSUB_DEFAULT_DATABASE", DEFAULT_DB_ALIAS)
 
 logger = logging.getLogger(__name__)
 
@@ -57,14 +67,13 @@ def start_listen_in_a_process(
             args.extend(channels)
         logger.debug(f'  with {args=}')
         process = multiprocessing.Process(
-            name=name, target=execute_from_command_line, args=(args, )
+            name=name, target=execute_from_command_line, args=(args,)
         )
     else:
         raise ValueError(f'Unsupported start method {start_method}')
 
     process.start()
     return process
-
 
 
 def listen(
@@ -98,7 +107,10 @@ def listen(
         connection_wrapper.stop()
 
 
-def listen_to_channels(channels: Union[List[BaseChannel], List[str]] = None):
+def listen_to_channels(
+    channels: list[BaseChannel] | list[str] = None,
+    database_alias: str = DEFAULT_DB_ALIAS,
+):
     if channels is None:
         channels = registry
     else:
@@ -110,9 +122,10 @@ def listen_to_channels(channels: Union[List[BaseChannel], List[str]] = None):
         }
     if not channels:
         raise ChannelNotFound()
+
+    connection = ConnectionProxy(connections, database_alias)
     cursor = connection.cursor()
-    # Notifications are started to being delivered only after the transaction commits.
-    # Check LISTEN documentation for detailed description.
+
     with transaction.atomic():
         for channel in channels:
             logger.info(f'Listening on {channel.name()}\n')
@@ -155,8 +168,7 @@ class NotificationProcessor:
         return self._execute()
 
     def _execute(self):
-        channel = self.channel_cls.build_from_payload(
-            self.notification.payload, self.callbacks)
+        channel = self.channel_cls.build_from_payload(self.notification.payload, self.callbacks)
         channel.execute_callbacks()
         self.connection_wrapper.poll()
 
@@ -168,39 +180,35 @@ class CastToJSONB(Func):
 def get_extra_filter() -> Q:
     extra_filter_provider_fq_name = getattr(settings, 'PGPUBSUB_LISTENER_FILTER', None)
     if extra_filter_provider_fq_name:
-        module = importlib.import_module(
-            '.'.join(extra_filter_provider_fq_name.split('.')[:-1])
-        )
+        module = importlib.import_module('.'.join(extra_filter_provider_fq_name.split('.')[:-1]))
         clazz = getattr(module, extra_filter_provider_fq_name.split('.')[-1])
         extra_filter_provider: ListenerFilterProvider = clazz()
         return extra_filter_provider.get_filter()
     else:
         return Q()
 
-class LockableNotificationProcessor(NotificationProcessor):
 
+class LockableNotificationProcessor(NotificationProcessor):
     def validate(self):
         if self.notification.payload == '':
             raise InvalidNotificationProcessor
 
     def process(self):
-        logger.info(
-            f'Processing notification for {self.channel_cls.name()}')
-        payload_filter = (
-            Q(payload=CastToJSONB(Value(self.notification.payload))) |
-            Q(payload=self.notification.payload)
+        logger.info(f'Processing notification for {self.channel_cls.name()}')
+        payload_filter = Q(payload=CastToJSONB(Value(self.notification.payload))) | Q(
+            payload=self.notification.payload
         )
         payload_filter &= get_extra_filter()
         notification = (
-            Notification.objects.select_for_update(
-                skip_locked=True).filter(
-                    payload_filter,
-                    channel=self.notification.channel,
-            ).first()
+            Notification.objects.select_for_update(skip_locked=True)
+            .filter(
+                payload_filter,
+                channel=self.notification.channel,
+            )
+            .first()
         )
         if notification is None:
-            logger.info(f'Could not obtain a lock on notification '
-                        f'{self.notification.pid}\n')
+            logger.info(f'Could not obtain a lock on notification ' f'{self.notification.pid}\n')
         else:
             logger.info(f'Obtained lock on {notification}')
             self.notification = notification
@@ -209,7 +217,6 @@ class LockableNotificationProcessor(NotificationProcessor):
 
 
 class NotificationRecoveryProcessor(LockableNotificationProcessor):
-
     def validate(self):
         if self.notification.payload != '':
             raise InvalidNotificationProcessor
@@ -218,8 +225,9 @@ class NotificationRecoveryProcessor(LockableNotificationProcessor):
         logger.info(f'Processing all notifications for channel {self.channel_cls.name()} \n')
         payload_filter = Q(channel=self.notification.channel) & get_extra_filter()
         notifications = (
-            Notification.objects.select_for_update(
-                skip_locked=True).filter(payload_filter).iterator()
+            Notification.objects.select_for_update(skip_locked=True)
+            .filter(payload_filter)
+            .iterator()
         )
         logger.info(f'Found notifications: {notifications}')
         for notification in notifications:
@@ -230,7 +238,7 @@ class NotificationRecoveryProcessor(LockableNotificationProcessor):
             except Exception as e:
                 logger.error(
                     f'Encountered {e} exception when processing notification {notification}',
-                    exc_info=e
+                    exc_info=e,
                 )
             else:
                 logger.info(f'Successfully processed notification {notification}')
