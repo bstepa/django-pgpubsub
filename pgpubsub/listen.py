@@ -126,7 +126,7 @@ def listen_to_channels(
     connection = ConnectionProxy(connections, database_alias)
     cursor = connection.cursor()
 
-    with transaction.atomic():
+    with transaction.atomic(using=database_alias):
         for channel in channels:
             logger.info(f'Listening on {channel.name()}\n')
             cursor.execute(f'LISTEN {channel.listen_safe_name()};')
@@ -137,7 +137,7 @@ def process_notifications(connection_wrapper):
     connection_wrapper.poll()
     while connection_wrapper.notifies:
         notification = connection_wrapper.notifies.pop(0)
-        with transaction.atomic():
+        with transaction.atomic(using=DEFAULT_DB_ALIAS):
             for processor in [
                 NotificationProcessor,
                 LockableNotificationProcessor,
@@ -233,7 +233,7 @@ class NotificationRecoveryProcessor(LockableNotificationProcessor):
         for notification in notifications:
             self.notification = notification
             try:
-                with transaction.atomic():
+                with transaction.atomic(using=DEFAULT_DB_ALIAS):
                     self._execute()
             except Exception as e:
                 logger.error(
