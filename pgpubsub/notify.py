@@ -1,8 +1,6 @@
 import logging
 from typing import Type, Union
 
-from django.db import connection
-
 from django.utils.connection import ConnectionProxy
 from django.db import connections, DEFAULT_DB_ALIAS
 from django.db.transaction import atomic
@@ -36,7 +34,7 @@ def notify(channel: Union[Type[Channel], str], database_alias: str = DEFAULT_DB_
     return serialized
 
 
-def process_stored_notifications(channels=None):
+def process_stored_notifications(channels=None, database_alias: str = DEFAULT_DB_ALIAS):
     """Have processes listening to channels process current stored notifications.
 
     This function sends a notification with an empty payload to all listening channels.
@@ -55,6 +53,7 @@ def process_stored_notifications(channels=None):
             for channel, callbacks in registry.items()
             if issubclass(channel, tuple(channels))
         }
+    connection = ConnectionProxy(connections, database_alias)
     with connection.cursor() as cursor:
         lock_channels = [c for c in channels if c.lock_notifications]
         for channel_cls in lock_channels:
